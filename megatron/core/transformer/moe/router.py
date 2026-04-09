@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
+import logging
+import os
 from typing import Optional, Union
 
 import torch
@@ -24,6 +26,16 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _thd_diag_enabled() -> bool:
+    return os.environ.get("THD_DIAG", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _rank0() -> bool:
+    return not torch.distributed.is_available() or not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
 
 class Router(ABC, MegatronModule):
@@ -215,6 +227,22 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+        self._thd_diag_router_count = 0
+        self._thd_diag_global_aux_count = 0
+        self._thd_diag_attach_count = 0
+
+    def _should_diag(self, key: str, max_count: int = 3) -> bool:
+        if not (_thd_diag_enabled() and _rank0()):
+            return False
+        # Restrict logging to one canonical layer to avoid per-layer log storms.
+        if self.layer_number not in (1, None):
+            return False
+        attr = f"_thd_diag_{key}_count"
+        count = int(getattr(self, attr, 0))
+        if count >= max_count:
+            return False
+        setattr(self, attr, count + 1)
+        return True
 
     def _maintain_float32_expert_bias(self):
         """
@@ -403,6 +431,21 @@ class TopKRouter(Router):
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
+        if self._should_diag("global_aux"):
+            logger.info(
+                "[THD_DIAG][moe_router] layer=%s global_aux_inputs: with_padding_mask=%s local_num_tokens=%s total_num_tokens=%s topk=%s num_experts=%s "
+                "sum_global_tokens_per_expert=%.3f sum_avg_tokens_per_expert=%.3f ga_steps=%.3f",
+                str(self.layer_number),
+                str(with_padding_mask),
+                str(local_num_tokens.item() if torch.is_tensor(local_num_tokens) else local_num_tokens),
+                str(total_num_tokens.item() if torch.is_tensor(total_num_tokens) else total_num_tokens),
+                str(self.topk),
+                str(self.config.num_moe_experts),
+                float(global_tokens_per_expert.sum().item()),
+                float(averated_tokens_per_expert.sum().item()),
+                float(self.ga_steps.item()),
+            )
+
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
             tokens_per_expert=averated_tokens_per_expert,
@@ -478,6 +521,18 @@ class TopKRouter(Router):
             reduce_group=reduce_group,
             needs_dp_avg=needs_dp_avg,
         )
+        if aux_loss_name == "global_load_balancing_loss" and self._should_diag("attach"):
+            logger.info(
+                "[THD_DIAG][moe_router] layer=%s attach_global_aux: aux_loss_raw=%.6e aux_loss_coeff=%.6e aux_loss_unscaled=%.6e "
+                "calculate_per_token_loss=%s valid_token_count=%s needs_dp_avg=%s",
+                str(self.layer_number),
+                float(aux_loss.item()),
+                float(aux_loss_coeff),
+                float((aux_loss / aux_loss_coeff).item()),
+                str(self.calculate_per_token_loss),
+                str(valid_token_count.item() if torch.is_tensor(valid_token_count) else valid_token_count),
+                str(needs_dp_avg),
+            )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
             # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
@@ -603,6 +658,14 @@ class TopKRouter(Router):
         # Flatten padding_mask to [num_tokens] if provided
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
+            if self._should_diag("router"):
+                logger.info(
+                    "[THD_DIAG][moe_router] layer=%s routing_padding_mask: num_tokens=%d mask_true=%d mask_false=%d",
+                    str(self.layer_number),
+                    int(padding_mask.numel()),
+                    int(padding_mask.sum().item()),
+                    int((~padding_mask).sum().item()),
+                )
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
